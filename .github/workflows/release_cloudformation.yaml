@@ -1,0 +1,63 @@
+name: Validate Cloudformation templates
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - main
+jobs:
+  release-aws-ssm-monitoring-logging-guardrails-multiaccount:
+    name: Validate and update Cloudformation templates
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Run Checkov action
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12.1810.0
+        with:
+          skip_check: CKV_AWS_2 # optional: skip a specific check_id. can be comma separated list
+          quiet: true # optional: display only failed checks
+          soft_fail: true # optional: do not return an error code if there are failed checks
+          framework: cloudformation # optional: run only on a specific infrastructure {cloudformation,terraform,kubernetes,all}
+          output_format: github_failed_only # optional: the output format, one of: cli, json, junitxml, github_failed_only, or sarif. Default: sarif
+          container_user: 1000
+
+      - uses: stelligent/cfn_nag@master
+        with:
+          input_path: aws-ssm-guardrails-log-archive-account.template
+
+      - uses: stelligent/cfn_nag@master
+        with:
+          input_path: aws-ssm-guardrails-org-member-account.template
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r tests/requirements.txt
+          pip install cfn-lint bandit black
+          pip3 install git+https://github.com/intuit/cfn_lambda_extractor
+
+      - name: Run tests
+        env:
+          AWS_DEFAULT_REGION: eu-central-1
+        run: |
+          cfn_lambda_extractor -c aws-ssm-guardrails-org-member-account.template -o ./ -p aws_ssm_guardrails_org_member_account
+          python -m unittest discover -v
+
+      - name: run cfn-lint
+        run: cfn-lint *.template
+
+      - name: Run Bandit ( Python SAST ), run Black
+        run: |
+          bandit -r tmp/

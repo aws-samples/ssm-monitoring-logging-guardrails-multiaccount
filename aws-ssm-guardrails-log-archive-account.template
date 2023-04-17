@@ -1,0 +1,368 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform:
+  - 'AWS::LanguageExtensions'
+Description: Blog post code, Central Component of the Solution.
+Parameters:
+  AWSOrgId:
+    Type: String
+    Description: |
+      Your AWS Organization ID. This will be used for scoping down resource level policies.
+      This will allow your organization member accounts to consume cross-account resources.
+  S3TransitionToStandardIADays:
+    Type: Number
+    Default: 30
+    Description: The number of days after object creation to transition to STANDARD_IA storage class
+    AllowedValues:
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+      - 3653
+  S3TransitionToGlacierDays:
+    Type: Number
+    Default: 60
+    Description: The number of days after object creation to transition to GLACIER storage class
+    AllowedValues:
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+      - 3653
+  S3ExpirationDays:
+    Type: Number
+    Default: 365
+    Description: The number of days after object creation to expire and delete the object
+    AllowedValues:
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+      - 3653
+  ProductionDeployment:
+    Type: String
+    Default: false
+    Description: |
+      This parameter defines type of deployment. If ProductionDeployment value is set to true, when AWS CloudFormation stack is deleted, following resources will be retained KMSKey, KeyAlias,
+      CentralSSMSessionLoggingS3BucketName, CentralSSMSessionLoggingS3BucketNameS3BucketPolicy, S3AccessLoggingBucket, S3AccessLoggingBucketPolicy. 
+      This allows retaining AWS Systems Manager Session Manager logs for Security and Compliance reasons.
+    AllowedValues:
+      - true
+      - false
+Conditions:
+  ProductionDeployment: !Equals
+    - !Ref 'ProductionDeployment'
+    - true
+Resources:
+  KMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: !If [ ProductionDeployment, Retain, Delete ]
+    UpdateReplacePolicy: !If [ ProductionDeployment, Retain, Delete ]
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F76
+            reason: Although the principal is * there is a condition restricting how the resource can be consumed.
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InAccountKey
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:*
+            Resource: '*'
+          - Sid: AllowAWSLogsService
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/ssm-session-logs'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/aws/lambda/check-ssm-session-s3-log-existence-function'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/aws/lambda/check-ssm-session-status-function'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/aws/lambda/check-ssm-session-target-iam-role-compliance-function'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/aws/statemachine/aws-ssm-monitoring-logging-guardrails-multiaccount-statemachine'
+          - Sid: KMSOrgUsage
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID:
+                  - !Ref 'AWSOrgId'
+          - Sid: CentralAlarmSNSTopic
+            Effect: Allow
+            Principal:
+              AWS:
+                - '*'
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              ForAnyValue:StringEquals:
+                kms:ViaService:
+                  - !Sub 'sns.${AWS::Region}.amazonaws.com'
+              StringEquals:
+                aws:PrincipalOrgID:
+                  - !Ref 'AWSOrgId'
+          - Sid: CWAlarm
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ForAnyValue:StringEquals:
+                kms:ViaService:
+                  - !Sub 'sns.${AWS::Region}.amazonaws.com'
+              ArnLike:
+                kms:EncryptionContext:aws:sns:topicArn:
+                  - !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-CentralAlarmSNSTopic-*'
+  KeyAlias:
+    DeletionPolicy: !If [ ProductionDeployment, Retain, Delete ]
+    UpdateReplacePolicy: !If [ ProductionDeployment, Retain, Delete ]
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}'
+      TargetKeyId: !Ref 'KMSKey'
+  CentralAlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KMSKey
+  CentralAlarmSNSTopicOrgPermissions:
+    Type: AWS::SNS::TopicPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F18
+            reason: Although the principal is * there is a condition restricting how the resource can be consumed.
+    Properties:
+      PolicyDocument:
+        Id: Id1
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublishThroughSSLOnly
+            Action: SNS:Publish
+            Effect: Deny
+            Resource:
+              - !Ref 'CentralAlarmSNSTopic'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Principal: '*'
+          - Sid: ORGPermissions
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: sns:Publish
+            Resource: !Ref 'CentralAlarmSNSTopic'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref 'AWSOrgId'
+              StringLike:
+                aws:PrincipalArn: !Sub '*:role/solution/aws-ssm-mntr-log-grdrails-mltacc-stp-fn-rl-${AWS::Region}'
+          - Sid: CWAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref 'CentralAlarmSNSTopic'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:*:alarm:aws-ssm-monitoring-logging-guardrails-multiaccount'
+      Topics:
+        - !Ref 'CentralAlarmSNSTopic'
+  CentralSSMSessionLoggingS3BucketName:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [ ProductionDeployment, Retain, Delete ]
+    UpdateReplacePolicy: !If [ ProductionDeployment, Retain, Delete ]
+    Properties:
+      BucketName: !Sub 'central-log-ssm-audit-${AWS::Region}-${AWSOrgId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: !Ref S3TransitionToStandardIADays
+              - StorageClass: GLACIER
+                TransitionInDays: !Ref S3TransitionToGlacierDays
+            ExpirationInDays: !Ref S3ExpirationDays
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: !Ref S3TransitionToStandardIADays
+              - StorageClass: GLACIER
+                TransitionInDays: !Ref S3TransitionToGlacierDays
+            NoncurrentVersionExpirationInDays: !Ref S3ExpirationDays
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      LoggingConfiguration:
+        DestinationBucketName: !Ref 'S3AccessLoggingBucket'
+        LogFilePrefix: !Sub 'central-log-audit-${AWS::Region}-ssm-${AWSOrgId}/'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt 'KMSKey.Arn'
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+  CentralSSMSessionLoggingS3BucketNameS3BucketPolicy:
+    DeletionPolicy: !If [ ProductionDeployment, Retain, Delete ]
+    UpdateReplacePolicy: !If [ ProductionDeployment, Retain, Delete ]
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16
+            reason: Although the principal is * there is a condition restricting how the resource can be consumed.
+    Properties:
+      Bucket: !Ref 'CentralSSMSessionLoggingS3BucketName'
+      PolicyDocument:
+        Id: CentralSSMSessionLoggingS3BucketName
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyIfNotSSL
+            Action: s3:*
+            Effect: Deny
+            Resource:
+              - !Sub '${CentralSSMSessionLoggingS3BucketName.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Principal: '*'
+
+          - Sid: DenyIfNotBucketOwnerFullControl
+            Action: s3:PutObject
+            Effect: Deny
+            Resource:
+              - !Sub '${CentralSSMSessionLoggingS3BucketName.Arn}/*'
+            Condition:
+              StringNotLikeIfExists:
+                s3:x-amz-acl: 'bucket-owner-full-control'
+            Principal: '*'
+
+          - Sid: DenyIfNotKMSKeyUsed
+            Action: s3:PutObject
+            Effect: Deny
+            Resource:
+              - !Sub '${CentralSSMSessionLoggingS3BucketName.Arn}/*'
+            Condition:
+              StringNotLikeIfExists:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt 'KMSKey.Arn'
+            Principal: '*'
+
+          - Sid: AllowBucketCrossAccount
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetObjectAcl
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+              - s3:ListBucketMultipartUploads
+              - s3:ListBucket
+              - s3:GetEncryptionConfiguration
+            Resource:
+              - !Sub '${CentralSSMSessionLoggingS3BucketName.Arn}/*'
+              - !Sub '${CentralSSMSessionLoggingS3BucketName.Arn}'
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID:
+                  - !Ref 'AWSOrgId'
+  S3AccessLoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [ ProductionDeployment, Retain, Delete ]
+    UpdateReplacePolicy: !If [ ProductionDeployment, Retain, Delete ]
+    Properties:
+      BucketName: !Sub 's3-access-log-${AWS::Region}-${AWSOrgId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 60
+            ExpirationInDays: 365
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 60
+            NoncurrentVersionExpirationInDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: S3 Bucket access logging not needed here.
+  S3AccessLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: !If [ ProductionDeployment, Retain, Delete ]
+    UpdateReplacePolicy: !If [ ProductionDeployment, Retain, Delete ]
+    Properties:
+      Bucket: !Ref 'S3AccessLoggingBucket'
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: '*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3AccessLoggingBucket}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3AccessLoggingBucket}'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+Outputs:
+  CentralSSMSessionLoggingS3BucketName:
+    Value: !Ref CentralSSMSessionLoggingS3BucketName
+  CentralSSMSessionMonitoringKMSKeyArn:
+    Value: !GetAtt KMSKey.Arn
+  CentralSSMSessionMonitoringSecurityComplianceSNSTopicArn:
+    Value: !Ref 'CentralAlarmSNSTopic'

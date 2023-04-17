@@ -1,0 +1,5 @@
+pytest
+pytest-mock
+boto3
+aws-lambda-powertools==2.9.1
+fastjsonschema==2.16.3

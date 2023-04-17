@@ -1,0 +1,1164 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Blog post code, AWS Organizations Member AWS Account stack, used to protect Session Manager, a capability of AWS Systems Manager, sessions.
+Parameters:
+  AWSOrgId:
+    Type: String
+    Description: |
+      Your AWS Organization ID. This will be used for scoping down resource level policies.
+      This will allow your organization member accounts to consume cross-account resources.
+  CWLogsRetentionInDays:
+    Type: Number
+    Description: |
+      Session Manager session logs will be stored in Amazon CloudWatch Logs in the Organizations member account for the specified retention period
+    Default: 180
+    AllowedValues:
+      - 90
+      - 180
+      - 365
+      - 3653
+  CentralSSMSessionLoggingS3BucketName:
+    Type: String
+    Description: |
+      This comes from Output of first stack, SSM logs delivery S3 bucket.
+  CentralSSMSessionMonitoringKMSKeyArn:
+    Type: String
+    Description: |
+      This comes from Output of first stack, Arn of KMS Key that will be used for encrypting Topics, S3, CloudWatch Logs.
+  CentralSSMSessionMonitoringSecurityComplianceSNSTopicArn:
+    Type: String
+    Description: |
+      This comes from Output of first stack, Log Archive Account SNS topic where all AWS Organizations Member Accounts will deliver also session termination notifications and CloudWatch alerts.
+  StepFunctionStateSleepSeconds:
+    Type: Number
+    Description: |
+      Specify the amount of time to sleep before the AWS Step Functions state machine reevaluates EC2 Instance Profile compliance.
+      The StepFunctions State Machine states will continuously loop after sleeping for specified amount of time.
+      Increasing this number reduces the cost of running StepFunctions state machine ( less state transitioning during the whole lifetime of one execution ) in favor increasing risk of having EC2 Instance Profile modified before it's detected.
+    Default: 15
+  SessionManagerIdleSessionTimeout:
+    Type: Number
+    Description: |
+      Inactive Session Manager session timeout threshold, set in minutes. Defaults to 10.
+    Default: 10
+  SessionManagerLoggingOptions:
+    Type: String
+    Description: |
+      This parameter decides whether to create CloudWatch log group and instruction set in System Manager Document behind sessions.
+      If this parameter is set to Central-S3-only, session activity will be only logged to a central S3 bucket, not in a CloudWatch log group of the Organization Member AWS Account where the solution is deployed.
+      This makes the solution cheaper to run, as there will be no costs for CloudWatch.
+    Default: Central-S3-only
+    AllowedValues:
+      - Central-S3-only
+      - Central-S3-and-CloudWatch-in-Org-Member-Account
+  TerminatedSessionsAlertThreshold:
+    Type: Number
+    Description: |
+      This parameter is threshold over a 5 minute period for State Machine terminated sessions.
+      The default value is 10, which means when Step Functions State Machine terminates 10 sessions within a 5 minute window, this will trigger a CloudWatch alarm with action to deliver an alert to Log Archive SNS Topic.
+    Default: 10
+  LambdaPowertoolsPythonVersion:
+    Type: String
+    Default: 39
+Conditions:
+  ShouldSendSessionLogsToCW: !Equals
+    - !Ref 'SessionManagerLoggingOptions'
+    - Central-S3-and-CloudWatch-in-Org-Member-Account
+Resources:
+  MandatorySSMSessionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: Suppress policy permitting usage of SSM.
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+    Properties:
+      ManagedPolicyName: !Sub 'aws-ssm-guardrails-mandatory-policy-${AWS::Region}'
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - !If
+            - ShouldSendSessionLogsToCW
+            - Sid: AllowCloudWatchLogStreaming
+              Effect: Allow
+              Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !GetAtt 'SystemsManagerSessionsLogsLogGroup.Arn'
+            - !Ref 'AWS::NoValue'
+          - !If
+            - ShouldSendSessionLogsToCW
+            - Sid: AllowCloudWatchDescribe
+              Effect: Allow
+              Action:
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+              Resource: '*'
+            - !Ref 'AWS::NoValue'
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              - !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetEncryptionConfiguration
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${CentralSSMSessionLoggingS3BucketName}/${AWS::AccountId}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${CentralSSMSessionLoggingS3BucketName}'
+  SystemsManagerSessionsLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldSendSessionLogsToCW
+    Properties:
+      LogGroupName: /ssm-session-logs
+      RetentionInDays: !Ref 'CWLogsRetentionInDays'
+      KmsKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+      Tags:
+        - Key: PrincipalOrgID
+          Value:  !Ref AWSOrgId
+  SecurityComplianceTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aws-ssm-monitoring-logging-guardrails-multiaccount
+      KmsMasterKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+  SecurityComplianceTopicOrgPermissions:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: Id1a
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublishThroughSSLOnly
+            Action: SNS:Publish
+            Effect: Deny
+            Resource:
+              - !Ref 'SecurityComplianceTopic'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+            Principal: '*'
+          - Sid: AccountPermissions
+            Effect: Deny
+            Principal:
+              AWS: !Sub '${AWS::AccountId}'
+            Action: sns:Publish
+            Resource: !Ref 'SecurityComplianceTopic'
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn: !GetAtt 'CheckSSMSessionStateMachineRole.Arn'
+      Topics:
+        - !Ref 'SecurityComplianceTopic'
+  SessionPreferencesDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: SSM-SessionManagerRunShell
+      Content:
+        schemaVersion: '1.0'
+        description: Document to hold regional settings for Session Manager
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: !Ref 'CentralSSMSessionLoggingS3BucketName'
+          s3KeyPrefix: !Sub '${AWS::AccountId}'
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: !If
+            - ShouldSendSessionLogsToCW
+            - !Ref 'SystemsManagerSessionsLogsLogGroup'
+            - !Ref 'AWS::NoValue'
+          cloudWatchEncryptionEnabled: !If
+            - ShouldSendSessionLogsToCW
+            - true
+            - !Ref 'AWS::NoValue'
+          cloudWatchStreamingEnabled: !If
+            - ShouldSendSessionLogsToCW
+            - true
+            - !Ref 'AWS::NoValue'
+          kmsKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+          idleSessionTimeout: !Ref 'SessionManagerIdleSessionTimeout'
+      DocumentType: Session
+      UpdateMethod: NewVersion
+  CheckSSMSessionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: aws-ssm-monitoring-logging-guardrails-multiaccount-statemachine
+      RoleArn: !GetAtt 'CheckSSMSessionStateMachineRole.Arn'
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt 'CheckSSMSessionStateMachineLogGroup.Arn'
+        IncludeExecutionData: true
+        Level: ALL
+      DefinitionString: !Sub |
+        {
+          "StartAt": "SessionStartedWithDefaultSSMDocument",
+          "States": {
+            "CheckS3LogExistence": {
+              "Next": "S3LogsExistsForSession",
+              "Resource": "${CheckSSMSessionS3LogExistenceLambdaFunction.Arn}",
+              "Type": "Task",
+              "Retry": [{
+                "ErrorEquals": [ "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }],
+              "Catch": [{
+                "ErrorEquals": [ "States.ALL" ],
+                "Next": "TransformForTerminateCatchError",
+                "ResultPath": "$.ForOutputError"
+              }]
+            },
+            "CheckSessionRoleCompliance": {
+              "Next": "IsSessionRoleCompliant",
+              "Resource": "${CheckSSMSessionTargetIamRoleComplianceLambdaFunction.Arn}",
+              "Type": "Task",
+              "Retry": [{
+                "ErrorEquals": [ "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }],
+              "Catch": [{
+                "ErrorEquals": [ "States.ALL" ],
+                "Next": "TransformForTerminateCatchError",
+                "ResultPath": "$.ForOutputError"
+              }]
+            },
+            "TransformForTerminateCatchError": {
+              "Next": "TerminateSession",
+              "Parameters": {
+                "executionId.$": "$$.Execution.Id",
+                "detail": { "responseElements": { "sessionId.$": "$.detail.responseElements.sessionId" }},
+                "TerminateReason": "Session Manager session has been terminated due to issues with Lambda function, report issue on GitHub. When opening issue do not publish sensitive information such as Amazon Resource Names.",
+                "ForOutputError.$": "$.ForOutputError"
+              },
+              "Type": "Pass"
+            },
+            "IsSessionTerminated": {
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "IsPresent": true,
+                      "Variable": "$.SessionIsTerminated"
+                    },
+                    {
+                        "BooleanEquals": true,
+                        "Variable": "$.SessionIsTerminated"
+                    }
+                  ],
+                  "Next": "Wait1MinThenValidateLog"
+                }
+              ],
+              "Type": "Choice",
+              "Default": "CheckSessionRoleCompliance"
+            },
+            "NonCompliantSNSNotification": {
+              "Next": "PutMetricData",
+              "Type": "Parallel",
+              "Branches":[
+                {
+                  "StartAt": "NonCompliantSNSNotificationLocal",
+                  "States": {
+                    "NonCompliantSNSNotificationLocal": {
+                      "End": true,
+                      "Parameters": {
+                        "Message.$": "$",
+                        "TopicArn": "${SecurityComplianceTopic}"
+                      },
+                      "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+                      "Type": "Task"
+                    }
+                  }
+                },
+                {
+                  "StartAt": "NonCompliantSNSNotificationCentral",
+                  "States": {
+                    "NonCompliantSNSNotificationCentral": {
+                      "End": true,
+                      "Parameters": {
+                        "Message.$": "$",
+                        "TopicArn": "${CentralSSMSessionMonitoringSecurityComplianceSNSTopicArn}"
+                      },
+                      "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+                      "Type": "Task"
+                    }
+                  }
+                }
+              ]
+            },
+            "PutMetricData": {
+              "Type": "Task",
+              "Next": "SessionNotCompliant",
+              "Parameters": {
+                "MetricData": [
+                  {
+                    "MetricName": "TerminatedSSMSessions",
+                    "Value": 1,
+                    "Unit": "Count"
+                  }
+                ],
+                "Namespace": "SSMMonitoringLoggingGuardrails"
+              },
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:cloudwatch:putMetricData"
+            },
+            "S3LogsExistsForSession": {
+              "Choices": [
+                {
+                  "BooleanEquals": false,
+                  "Next": "NonCompliantSNSNotification",
+                  "Variable": "$.S3SessionLogsPresent"
+                }
+              ],
+              "Type": "Choice",
+              "Default": "SessionWasCompliant"
+            },
+            "SessionNotCompliant": {
+              "Type": "Fail",
+              "Cause": "Session Manager session was not compliant with Guardrails please investigate."
+            },
+            "IsSessionRoleCompliant": {
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "IsPresent": true,
+                      "Variable": "$.TerminateNonCompliantSession"
+                    },
+                    {
+                        "BooleanEquals": true,
+                        "Variable": "$.TerminateNonCompliantSession"
+                    }
+                  ],
+                  "Next": "TerminateSession"
+                }
+              ],
+              "Default": "WaitInSecondsThenCheckSessionStatus",
+              "Type": "Choice"
+            },
+            "SessionStartedWithDefaultSSMDocument": {
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "IsPresent": true,
+                      "Variable": "$.detail.requestParameters.documentName"
+                    },
+                    {
+                      "Not": {
+                        "StringEquals": "SSM-SessionManagerRunShell",
+                        "Variable": "$.detail.requestParameters.documentName"
+                      }
+                    }
+                  ],
+                  "Next": "TransformForTerminateNonDefaultDocument"
+                }
+              ],
+              "Default": "CheckSessionRoleCompliance",
+              "Type": "Choice"
+            },
+            "SessionWasCompliant": {
+              "Type": "Succeed"
+            },
+            "TerminateSession": {
+              "Type": "Task",
+              "Next": "NonCompliantSNSNotification",
+              "Parameters": {
+                "SessionId.$": "$.detail.responseElements.sessionId"
+              },
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:ssm:terminateSession",
+              "ResultPath": null
+            },
+            "TransformForTerminateNonDefaultDocument": {
+              "Next": "TerminateSession",
+              "Type": "Pass",
+              "ResultPath": "$.TerminateReason",
+              "Result": "Session Manager session has been terminated due to uncompliant SSM Document usage with ssm:StartSession! Must be default SSM-SessionManagerRunShell! Investigate CloudTrail event coming with this Notification!"
+            },
+            "Wait1MinThenValidateLog": {
+              "Next": "CheckS3LogExistence",
+              "Seconds": 10,
+              "Type": "Wait"
+            },
+            "WaitInSecondsThenCheckSessionStatus": {
+              "Next": "CheckSessionStatus",
+              "Seconds": ${StepFunctionStateSleepSeconds},
+              "Type": "Wait"
+            },
+            "CheckSessionStatus": {
+              "Next": "IsSessionTerminated",
+              "Resource": "${CheckSSMSessionStatusLambdaFunction.Arn}",
+              "Type": "Task",
+              "Retry": [{
+                "ErrorEquals": [ "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }],
+              "Catch": [{
+                "ErrorEquals": [ "States.ALL" ],
+                "Next": "TransformForTerminateCatchError",
+                "ResultPath": "$.ForOutputError"
+              }]
+            }
+          }
+        }
+
+
+
+  CheckSSMSessionTargetIamRoleComplianceLambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/check-ssm-session-target-iam-role-compliance-function
+      RetentionInDays: !Ref 'CWLogsRetentionInDays'
+      KmsKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+      Tags:
+        - Key: PrincipalOrgID
+          Value:  !Ref AWSOrgId
+  CheckSSMSessionTargetIamRoleComplianceLambdaFunction:
+    DependsOn:
+      - 'CheckSSMSessionTargetIamRoleComplianceLambdaFunctionLogGroup'
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: No need to have Lambda in VPC
+          - id: W92
+            reason: ReservedConcurrentExecutions is not needed, Lambda is internal and started when SSM is used
+    Properties:
+      FunctionName: check-ssm-session-target-iam-role-compliance-function
+      Handler: index.lambda_handler
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPython:${LambdaPowertoolsPythonVersion}"
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SSM_POLICY_ARN: !Ref 'MandatorySSMSessionPolicy'
+          SESSION_LOGGING_BUCKET: !Ref 'CentralSSMSessionLoggingS3BucketName'
+          SESSION_LOGGING_CW_GROUP: !If
+            - ShouldSendSessionLogsToCW
+            - !Ref 'SystemsManagerSessionsLogsLogGroup'
+            - !Ref 'AWS::NoValue'
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+          from aws_lambda_powertools.utilities.validation import SchemaValidationError, validate
+
+
+          class LambdaHandler:
+              def __init__(self, event):
+                  self.ec2_c = boto3.client("ec2")
+                  self.ssm_c = boto3.client("ssm")
+                  self.iam_c = boto3.client("iam")
+                  self.event = event
+                  self.mandatory_policy_arn = os.getenv("SSM_POLICY_ARN")
+                  if self.mandatory_policy_arn is None:
+                      raise EnvironmentError("Missing ENV variable SSM_POLICY_ARN")
+                  self.target = self.get_ssm_target_from_cloudtrail_event()
+                  self.ec2_role = self.fetch_target_instance_profile_role()["RoleName"]
+
+              def get_ssm_target_from_cloudtrail_event(self):
+                  extraction_schema = {
+                      "$schema": "http://json-schema.org/draft-07/schema#",
+                      "type": "object",
+                      "properties": {
+                          "detail": {
+                              "type": "object",
+                              "properties": {
+                                  "requestParameters": {
+                                      "type": "object",
+                                      "properties": {
+                                          "target": {
+                                              "type": "string",
+                                              "pattern": "^(i-|mi-)[a-zA-Z0-9]+$",
+                                          }
+                                      },
+                                      "required": ["target"],
+                                  }
+                              },
+                              "required": ["requestParameters"],
+                          }
+                      },
+                      "required": ["detail"],
+                  }
+                  try:
+                      validate(event=self.event, schema=extraction_schema)
+                  except SchemaValidationError:
+                      raise ValueError(
+                          "Malformed input! Cloudtrial event contains SSM StartSession"
+                          " target that is not matching pattern i-* or mi-*, or is not"
+                          " matching extraction mapping."
+                          " $.detail.requestParameters.target"
+                      )
+                  return self.event["detail"]["requestParameters"]["target"]
+
+              def fetch_target_instance_profile_role(self):
+                  try:
+                      describe_instance_response = self.ec2_c.describe_instances(
+                          InstanceIds=[self.target],
+                          Filters=[{"Name": "instance-state-name", "Values": ["running"]}],
+                      ).get("Reservations")
+                      if len(describe_instance_response) == 1:
+                          instance_profile_arn = (
+                              describe_instance_response[0]
+                              .get("Instances")[0]
+                              .get("IamInstanceProfile", {"Arn": None})
+                              .get("Arn")
+                          )
+                          if instance_profile_arn is not None:
+                              instance_profile_role = [
+                                  {
+                                      "RoleName": p.get("Roles")[0].get("RoleName"),
+                                      "Arn": p.get("Roles")[0].get("Arn"),
+                                  }
+                                  for p in LambdaHandler.paginator(
+                                      self.iam_c,
+                                      "list_instance_profiles",
+                                      "Marker",
+                                      "InstanceProfiles",
+                                  )
+                                  if p.get("Arn") == instance_profile_arn
+                              ][0]
+                              return instance_profile_role
+                          else:
+                              raise ValueError(
+                                  "Seems that there is no EC2 Instance Profile associated"
+                                  " with Instance {}".format(self.target)
+                              )
+                      else:
+                          raise ValueError(
+                              "Seems that there is no EC2 Instance running with id {}".format(
+                                  self.target
+                              )
+                          )
+                  except ClientError as error:
+                      try:
+                          if error.response["Error"]["Code"] == "InvalidInstanceID.Malformed":
+                              hybrid_activation_role = (
+                                  self.ssm_c.describe_instance_information(
+                                      InstanceInformationFilterList=[
+                                          {
+                                              "key": "InstanceIds",
+                                              "valueSet": [
+                                                  self.target,
+                                              ],
+                                          },
+                                      ],
+                                  )
+                                  .get("InstanceInformationList", [{"IamRole": None}])[0]
+                                  .get("IamRole")
+                              ).replace("service-role/", "")
+                              return {
+                                  "RoleName": hybrid_activation_role,
+                                  "Arn": self.iam_c.get_role(RoleName=hybrid_activation_role)
+                                  .get("Role", {})
+                                  .get("Arn"),
+                              }
+                      except:
+                          raise ValueError(
+                              (
+                                  "Lambda function fetch_target_instance_profile_role failed to get"
+                                  "Instance Profile or SSM Role associated with {} SSM Target."
+                              ).format(self.target)
+                          )
+
+              def validate_all_policies_associated_with_iam_role(self):
+                  self.event["TerminateReason"] = []
+                  actions_to_check = ["s3", "kms", "logs"]
+                  ec2_role_policies = [
+                      policy["PolicyArn"]
+                      for policy in LambdaHandler.paginator(
+                          self.iam_c,
+                          "list_attached_role_policies",
+                          "Marker",
+                          "AttachedPolicies",
+                          RoleName=self.ec2_role,
+                      )
+                  ]
+                  if self.mandatory_policy_arn not in ec2_role_policies:
+                      reason = (
+                          "Session is terminated, because EC2 IAM Role {}"
+                          " is missing Customer Managed Policy {} attached,"
+                          " in order to be compliant."
+                      ).format(self.ec2_role, self.mandatory_policy_arn)
+                      self.event["TerminateNonCompliantSession"] = True
+                      self.event["TerminateReason"].append(reason)
+                  for policy_arn in ec2_role_policies:
+                      policy_document = self.iam_c.get_policy(PolicyArn=policy_arn)
+                      active_policy_version_statements = self.iam_c.get_policy_version(
+                          PolicyArn=policy_arn,
+                          VersionId=policy_document["Policy"]["DefaultVersionId"],
+                      )["PolicyVersion"]["Document"]["Statement"]
+                      for statement in active_policy_version_statements:
+                          if statement.get("Effect") != "Deny":
+                              continue
+                          actions = statement.get("Action", [])
+                          if not isinstance(actions, list):
+                              actions = [actions]
+                          for action in actions:
+                              action = action.split(":")[0].lower()
+                              if action in actions_to_check:
+                                  reason = (
+                                      "{} is having an explicit Deny for {} Actions in"
+                                      " attached IAM Customer Managed Policy {}, this has"
+                                      " to be removed in order to be compliant."
+                                  ).format(self.ec2_role, action, policy_arn)
+                                  self.event["TerminateNonCompliantSession"] = True
+                                  self.event["TerminateReason"].append(reason)
+
+              def validate_all_inline_policies_associated_with_iam_role(self):
+                  non_compliant_policies = []
+                  for inline_policy_name in list(
+                      LambdaHandler.paginator(
+                          self.iam_c,
+                          "list_role_policies",
+                          "Marker",
+                          "PolicyNames",
+                          RoleName=self.ec2_role,
+                      )
+                  ):
+                      policy = self.iam_c.get_role_policy(
+                          RoleName=self.ec2_role, PolicyName=inline_policy_name
+                      )
+                      policy_document = policy.get("PolicyDocument", {})
+                      statements = policy_document.get("Statement", [])
+
+                      for statement in statements:
+                          if statement.get("Effect") == "Deny":
+                              actions = statement.get("Action", [])
+                              if not isinstance(actions, list):
+                                  actions = [actions]
+                              for action in actions:
+                                  if action.split(":")[0].lower() in ["s3", "kms", "logs"]:
+                                      non_compliant_policies.append(inline_policy_name)
+                                      break
+                  if non_compliant_policies:
+                      self.event["TerminateNonCompliantSession"] = True
+                      terminate_reason = [
+                          "{} is having Explicit Deny for either s3, kms, logs Actions in attached IAM inline Policy {}, this has to be removed in order to be compliant.".format(
+                              self.ec2_role, policy
+                          )
+                          for policy in non_compliant_policies
+                      ]
+                      if len(self.event.get("TerminateReason", [])) == 0:
+                          self.event["TerminateReason"] = terminate_reason
+                      else:
+                          self.event["TerminateReason"].append(terminate_reason)
+
+              @staticmethod
+              def paginator(
+                  service_client: boto3.client,
+                  api_to_paginate: str,
+                  pagination_token_key: str,
+                  page_key_to_extract: str,
+                  **kwargs
+              ):
+                  method = None
+                  try:
+                      method = getattr(service_client, api_to_paginate)
+                  except AttributeError:
+                      raise AttributeError(
+                          "Class `{}` does not implement `{}`".format(
+                              service_client.__class__.__name__, api_to_paginate
+                          )
+                      )
+                  try:
+                      pp_dict = method(**kwargs)
+                      if page_key_to_extract in pp_dict:
+                          for element in pp_dict[page_key_to_extract]:
+                              yield element
+                      while pagination_token_key in pp_dict:
+                          next_token = pp_dict[pagination_token_key]
+                          try:
+                              pp_dict = method(**kwargs, **{pagination_token_key: next_token})
+                              if page_key_to_extract in pp_dict:
+                                  for element in pp_dict[page_key_to_extract]:
+                                      yield element
+                          except ClientError as exe:
+                              raise ClientError(
+                                  "Failed to call subsequent {} call in order to"
+                                  " paginate, {}".format(api_to_paginate, exe)
+                              )
+                  except ClientError as exe:
+                      raise ClientError(
+                          "Failed to invoke first client API call on {}, stacktrace: {}.".format(
+                              api_to_paginate, exe
+                          )
+                      )
+
+              def handle(self):
+                  self.validate_all_policies_associated_with_iam_role()
+                  self.validate_all_inline_policies_associated_with_iam_role()
+                  return self.event
+
+
+          def lambda_handler(event, context):
+              handler = LambdaHandler(event)
+              return handler.handle()
+
+      MemorySize: 128
+      Role: !GetAtt 'CheckSSMSessionTargetIamRoleComplianceLambdaFunctionRole.Arn'
+      Timeout: 60
+
+  CheckSSMSessionS3LogExistenceLambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/check-ssm-session-s3-log-existence-function
+      RetentionInDays: !Ref 'CWLogsRetentionInDays'
+      KmsKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+      Tags:
+        - Key: PrincipalOrgID
+          Value:  !Ref AWSOrgId
+  CheckSSMSessionS3LogExistenceLambdaFunction:
+    DependsOn:
+      - 'CheckSSMSessionS3LogExistenceLambdaFunctionLogGroup'
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: No need to have Lambda in VPC
+          - id: W92
+            reason: ReservedConcurrentExecutions is not needed, Lambda is internal and started when SSM is used
+    Properties:
+      FunctionName: check-ssm-session-s3-log-existence-function
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SESSION_LOGGING_BUCKET: !Ref 'CentralSSMSessionLoggingS3BucketName'
+          SESSION_LOGGING_CW_GROUP: !If
+            - ShouldSendSessionLogsToCW
+            - !Ref 'SystemsManagerSessionsLogsLogGroup'
+            - !Ref 'AWS::NoValue'
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          session_logging_bucket = os.environ.get("SESSION_LOGGING_BUCKET")
+          if session_logging_bucket is None:
+              raise EnvironmentError("Missing ENV variable: SESSION_LOGGING_BUCKET")
+          session_logging_cw_group = os.environ.get("SESSION_LOGGING_CW_GROUP")
+
+
+          def lambda_handler(event, context):
+              s3_client = boto3.client("s3")
+              logs_client = boto3.client("logs")
+
+              session_id = event.get("detail", {}).get("responseElements", {}).get("sessionId")
+              if session_id is None:
+                  raise ValueError(
+                      "Malformed Cloudtrail Input: sessionId can not be extracted from event!"
+                  )
+
+              s3_list_objects = s3_client.list_objects_v2(
+                  Bucket=session_logging_bucket,
+                  Prefix=f"{event.get('account')}/{event.get('region')}/{session_id}.log",
+              ).get("Contents", [])
+
+              if session_logging_cw_group:
+                  cw_log_streams = logs_client.describe_log_streams(
+                      logGroupName=session_logging_cw_group,
+                      logStreamNamePrefix=session_id,
+                  ).get("logStreams", [])
+
+                  if len(cw_log_streams) > 0:
+                      event["S3SessionLogsPresent"] = len(s3_list_objects) > 0
+                  else:
+                      event["S3SessionLogsPresent"] = True
+              else:
+                  event["S3SessionLogsPresent"] = len(s3_list_objects) > 0
+
+              if event["S3SessionLogsPresent"] != True:
+                  event[
+                      "AlertReason"
+                  ] = f"For SSM Session {session_id}, Guardrails were not able to validate presence of SSM Session Logs - s3://{session_logging_bucket}/{event.get('account')}/{event.get('region')}/{session_id}.log"
+
+              return event
+
+
+      MemorySize: 128
+      Role: !GetAtt 'CheckSSMSessionS3LogExistenceLambdaFunctionRole.Arn'
+      Timeout: 60
+
+  CheckSSMSessionStatusLambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/check-ssm-session-status-function
+      RetentionInDays: !Ref 'CWLogsRetentionInDays'
+      KmsKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+      Tags:
+        - Key: PrincipalOrgID
+          Value:  !Ref AWSOrgId
+  CheckSSMSessionStatusLambdaFunction:
+    DependsOn:
+      - 'CheckSSMSessionStatusLambdaFunctionLogGroup'
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: No need to have Lambda in VPC
+          - id: W92
+            reason: ReservedConcurrentExecutions is not needed, Lambda is internal and started when SSM is used
+    Properties:
+      FunctionName: check-ssm-session-status-function
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+
+
+          def lambda_handler(event, context):
+              session_id = event.get("detail", {}).get("responseElements", {}).get("sessionId")
+              if session_id is None:
+                  raise ValueError(
+                      "Malformed Cloudtrail Input: sessionId can not be extracted from event!"
+                  )
+
+              ssm_client = boto3.client("ssm")
+              sessions = ssm_client.describe_sessions(
+                  State="Active", Filters=[{"key": "SessionId", "value": session_id}]
+              ).get("Sessions", [])
+
+              event["SessionIsTerminated"] = len(sessions) == 0
+              return event
+      MemorySize: 128
+      Role: !GetAtt 'CheckSSMSessionStatusLambdaFunctionRole.Arn'
+      Timeout: 60
+  TooManyTerminatedSessionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+    Properties:
+      AlarmName: aws-ssm-monitoring-logging-guardrails-multiaccount
+      AlarmDescription: Monitoring how many Session Manager sessions have been terminated within a 5 minute window.
+      AlarmActions:
+        - !Ref 'CentralSSMSessionMonitoringSecurityComplianceSNSTopicArn'
+      MetricName: TerminatedSSMSessions
+      Namespace: SSMMonitoringLoggingGuardrails
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: !Ref 'TerminatedSessionsAlertThreshold'
+      TreatMissingData: notBreaching
+  CheckSSMSessionStatusLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM permissions are still minimal, and it is required to scan Roles/Policies
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+    Properties:
+      RoleName: !Sub "check-ssm-session-stat-fnc-rl-${AWS::Region}"
+      Description: !Sub "AWS Identity and Access Management (IAM) role deployed via ${AWS::StackName} which is used by check-ssm-session-status-function AWS Lambda function in ${AWS::Region}."
+      Path: /solution/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeSessions
+                Resource:
+                  - '*'
+        - PolicyName: CloudWatchPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateCloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'CheckSSMSessionStatusLambdaFunctionLogGroup.Arn'
+              - Sid: DescribeCloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+  CheckSSMSessionS3LogExistenceLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM permissions are still minimal, and it is required to scan Roles/Policies
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+    Properties:
+      RoleName: !Sub "check-ssm-session-s3-fnc-rl-${AWS::Region}"
+      Description: !Sub "AWS Identity and Access Management (IAM) role deployed via ${AWS::StackName} which is used by check-ssm-session-s3-log-existence-function AWS Lambda function in ${AWS::Region}."
+      Path: /solution/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${CentralSSMSessionLoggingS3BucketName}'
+        - PolicyName: CloudWatchPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateCloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'CheckSSMSessionS3LogExistenceLambdaFunctionLogGroup.Arn'
+              - Sid: DescribeCloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+  CheckSSMSessionTargetIamRoleComplianceLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM permissions are still minimal, and it is required to scan Roles/Policies
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+    Properties:
+      RoleName: !Sub "check-ssm-session-trgt-iam-rl-cmpl-fn-${AWS::Region}"
+      Description: !Sub "AWS Identity and Access Management (IAM) role deployed via ${AWS::StackName} which is used by check-ssm-session-target-iam-role-compliance-function AWS Lambda function in ${AWS::Region}."
+      Path: /solution/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ssm:DescribeInstanceInformation
+                  - iam:ListInstanceProfiles
+                  - iam:GetRole
+                  - iam:ListRolePolicies
+                  - iam:GetRolePolicy
+                  - iam:GetUser
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+              - Effect: Allow
+                Action:
+                  - iam:ListAttachedUserPolicies
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+        - PolicyName: CloudWatchPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateCloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'CheckSSMSessionTargetIamRoleComplianceLambdaFunctionLogGroup.Arn'
+              - Sid: DescribeCloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+  CheckSSMSessionStateMachineRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Although the resource allows the "*" principal, there is condition restricting how
+              the resource can be consumed, and for CloudWatch Logs for StateMachine seems that
+              resource has to be. ( https://github.com/aws/aws-cdk/issues/7158 )
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+          - id: W76
+            reason: Permissions are minimal as possible for needed job.
+    Properties:
+      RoleName: !Sub "aws-ssm-mntr-log-grdrails-mltacc-stp-fn-rl-${AWS::Region}"
+      Description: !Sub "AWS Identity and Access Management (IAM) role deployed via ${AWS::StackName} which is used by aws-ssm-monitoring-logging-guardrails-multiaccount-statemachine	AWS Step Functions state machine in ${AWS::Region}."
+      Path: /solution/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt 'CheckSSMSessionStatusLambdaFunction.Arn'
+                  - !GetAtt 'CheckSSMSessionS3LogExistenceLambdaFunction.Arn'
+                  - !GetAtt 'CheckSSMSessionTargetIamRoleComplianceLambdaFunction.Arn'
+              - Effect: Allow
+                Action:
+                  - ssm:TerminateSession
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:session/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref 'SecurityComplianceTopic'
+                  - !Ref 'CentralSSMSessionMonitoringSecurityComplianceSNSTopicArn'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource:
+                  - '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: SSMMonitoringLoggingGuardrails
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+              - Sid: CloudWatchPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutLogEvents
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource:
+                  - '*'
+  CheckSSMSessionStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/statemachine/aws-ssm-monitoring-logging-guardrails-multiaccount-statemachine
+      RetentionInDays: !Ref 'CWLogsRetentionInDays'
+      KmsKeyId: !Ref 'CentralSSMSessionMonitoringKMSKeyArn'
+      Tags:
+        - Key: PrincipalOrgID
+          Value:  !Ref AWSOrgId
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Explicit name helps with protecting resource via SCP
+    Properties:
+      RoleName: !Sub "aws-ssm-mntr-log-grdrails-mltacc-ev-brdg-rl-${AWS::Region}"
+      Description: !Sub "AWS Identity and Access Management (IAM) role deployed via ${AWS::StackName} which is used by aws-ssm-monitoring-logging-guardrails-multiaccount-event-rule Amazon EventBridge rule in ${AWS::Region}."
+      Path: /solution/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref 'CheckSSMSessionStateMachine'
+  CheckSSMSessionStateMachineTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      State: ENABLED
+      Name: aws-ssm-monitoring-logging-guardrails-multiaccount-event-rule
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          responseElements.sessionId:
+            - exists: true
+          eventSource:
+            - ssm.amazonaws.com
+          eventName:
+            - StartSession
+      Targets:
+        - Arn: !GetAtt 'CheckSSMSessionStateMachine.Arn'
+          Id: CheckSSMSessionStateMachine
+          RoleArn: !GetAtt 'EventBridgeRole.Arn'
