@@ -332,7 +332,6 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      AccessControl: LogDeliveryWrite
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -359,6 +358,19 @@ Resources:
             Condition:
               Bool:
                 aws:SecureTransport: false
+          - Effect: Allow
+            Principal:
+              Service:
+                - logging.s3.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${S3AccessLoggingBucket}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn : !Sub 'arn:aws:s3:::central-log-ssm-audit-${AWS::Region}-${AWSOrgId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
 Outputs:
   CentralSSMSessionLoggingS3BucketName:
     Value: !Ref CentralSSMSessionLoggingS3BucketName
